@@ -139,7 +139,7 @@ local function getLedger(): DataStore?
 end
 
 local function ledgerKey(receipt: Receipt): string
-	return `{receipt.PlayerId}_{receipt.PurchaseId}`
+	return receipt.PurchaseId
 end
 
 -- Atomically claims the receipt. Returns one of:
