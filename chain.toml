@@ -1,0 +1,12 @@
+[Package]
+  Name = "vibeonline/razormarket"
+  Description = "Oversimplifying the market service"
+  Version = "0.1.0"
+  License = "MIT"
+  Website = ""https://sawblade-entertainment.github.io/pkg-razor-market/"
+
+[Tools]
+  StyLua = "JohnnyMorganz/StyLua@2.6.0"
+  Selene = "Kampfkarren/selene@0.32.0"
+
+[Packages]
