@@ -1,34 +1,112 @@
-RazorData = use "razordata"
-S = RazorData.Serializer
+-- Test harness for RazorMarket (not part of the package).
+-- Runs the real ProcessReceipt pipeline against fake receipts and asserts exactly-once grants.
+-- Requires DataStore API access (or set USE_LEDGER = false for pure local testing).
+local HttpService = game:GetService("HttpService")
+local Players = game:GetService("Players")
+local ReplicatedStorage = game:GetService("ReplicatedStorage")
+local RazorMarket = require(ReplicatedStorage:WaitForChild("RazorMarket"))
 
--- Serializer round-trips
-local sample = {
-    v3 = Vector3.new(1, 2, 3), cf = CFrame.new(1, 2, 3) * CFrame.Angles(0, 1, 0),
-    c3 = Color3.new(1, 0, 0.5), mat = Enum.Material.Neon, dt = DateTime.now(),
-    ns = NumberSequence.new(0, 1), udim2 = UDim2.fromScale(0.5, 0.5),
-    mixed = { [1] = "a", [5] = "b", key = true }, inf = math.huge,
-}
-local decoded = S.Decode(game:GetService("HttpService"):JSONDecode(
-    game:GetService("HttpService"):JSONEncode(S.Encode(sample))))
-assert(decoded.v3 == sample.v3, "Vector3")
-assert(decoded.cf == sample.cf, "CFrame")
-assert(decoded.mat == Enum.Material.Neon, "EnumItem")
-assert(decoded.mixed[5] == "b" and decoded.mixed.key, "mixed table")
-assert(decoded.inf == math.huge, "inf")
+local TEST_PRODUCT = 0 -- replace with a real developer product id
+local TEST_PASS = 0 -- replace with a real game pass id
+local USE_LEDGER = true
 
--- Migrations
-local M = RazorData.Migrations.new({
-    function(d) d.Coins = d.Gold or 0; d.Gold = nil end,
-    function(d) d.Inventory = d.Inventory or {} end,
+-- Stand-in for the player's saved profile. In a real game this is your DataStore profile,
+-- and PurchaseId must be saved in the SAME write as the granted item.
+local profiles: { [number]: { Purchases: { [string]: boolean }, Coins: number } } = {}
+local grantCount: { [string]: number } = {}
+
+local function getProfile(player: Player)
+	profiles[player.UserId] = profiles[player.UserId] or { Purchases = {}, Coins = 0 }
+	return profiles[player.UserId]
+end
+
+RazorMarket.Configure({
+	UseLedger = USE_LEDGER,
+	IsAlreadyGranted = function(player, purchaseId)
+		return getProfile(player).Purchases[purchaseId] == true
+	end,
 })
-local migrated, v = M:Run({ Gold = 50 }, 0)
-assert(v == 2 and migrated.Coins == 50 and migrated.Gold == nil, "migration")
 
--- Session lock (live DataStore)
-local store = RazorData.new({ Name = "RazorDataTest", Template = { Coins = 0 }, LoadRetries = 1, RetryDelay = 0 })
-local profile = assert(store:LoadProfile("test-key"))
-profile.Data.Coins += 1
-assert(profile:Save(), "save")
-assert(profile:Release(), "release")
-assert(not profile:IsActive(), "inactive after release")
-print("[RazorData] all tests passed")
+RazorMarket.HandleProduct(TEST_PRODUCT, function(player, receipt)
+	local profile = getProfile(player)
+	if profile.Purchases[receipt.PurchaseId] then
+		return true -- idempotent
+	end
+	profile.Coins += 100
+	profile.Purchases[receipt.PurchaseId] = true
+	grantCount[receipt.PurchaseId] = (grantCount[receipt.PurchaseId] or 0) + 1
+	-- Real game: yield here until the profile is saved, then return true.
+	print(`[Test] Granted product to {player.Name} ({receipt.PurchaseId})`)
+	return true
+end)
+
+RazorMarket.HandleGamePass(TEST_PASS, function(player, passId)
+	print(`[Test] {player.Name} owns pass {passId}`)
+end)
+
+RazorMarket.Start()
+
+local function fakeReceipt(player: Player, purchaseId: string)
+	return {
+		PurchaseId = purchaseId,
+		PlayerId = player.UserId,
+		ProductId = TEST_PRODUCT,
+		PlaceIdWherePurchased = game.PlaceId,
+		CurrencySpent = 0,
+		CurrencyType = Enum.CurrencyType.Robux,
+	}
+end
+
+local function runTests(player: Player)
+	local Granted = Enum.ProductPurchaseDecision.PurchaseGranted
+	local NotYet = Enum.ProductPurchaseDecision.NotProcessedYet
+
+	-- 1. First delivery grants.
+	local id = "test_" .. HttpService:GenerateGUID(false)
+	local d1 = RazorMarket._processReceipt(fakeReceipt(player, id))
+	assert(d1 == Granted, `expected PurchaseGranted on first delivery, got {d1}`)
+	assert(grantCount[id] == 1, "handler should have run exactly once")
+
+	-- 2. Duplicate delivery is acknowledged WITHOUT re-granting.
+	local d2 = RazorMarket._processReceipt(fakeReceipt(player, id))
+	assert(d2 == Granted, `expected PurchaseGranted on duplicate, got {d2}`)
+	assert(grantCount[id] == 1, "duplicate receipt re-ran the handler!")
+
+	-- 3. Concurrent duplicate on the same server is deferred, not double-granted.
+	local id2 = "test_" .. HttpService:GenerateGUID(false)
+	local results = {}
+	for i = 1, 2 do
+		task.spawn(function()
+			results[i] = RazorMarket._processReceipt(fakeReceipt(player, id2))
+		end)
+	end
+	repeat
+		task.wait(0.1)
+	until results[1] ~= nil and results[2] ~= nil
+	assert(grantCount[id2] == 1, "concurrent receipts double-granted!")
+	assert(
+		(results[1] == Granted and results[2] == NotYet) or (results[1] == NotYet and results[2] == Granted)
+			or (results[1] == Granted and results[2] == Granted),
+		"unexpected concurrent decisions"
+	)
+
+	-- 4. Unknown product => NotProcessedYet (no default handler registered).
+	local bad = fakeReceipt(player, "test_" .. HttpService:GenerateGUID(false))
+	bad.ProductId = -1
+	assert(RazorMarket._processReceipt(bad) == NotYet, "unknown product must not be marked granted")
+
+	print("[Test] All RazorMarket receipt tests passed for", player.Name)
+end
+
+local function onPlayer(player: Player)
+	task.spawn(function()
+		local ok, err = pcall(runTests, player)
+		if not ok then
+			warn("[Test] FAILED:", err)
+		end
+	end)
+end
+Players.PlayerAdded:Connect(onPlayer)
+for _, player in Players:GetPlayers() do
+	onPlayer(player)
+end
