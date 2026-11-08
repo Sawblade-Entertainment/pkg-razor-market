@@ -1,10 +1,9 @@
 -- Test harness for RazorMarket (not part of the package).
 -- Runs the real ProcessReceipt pipeline against fake receipts and asserts exactly-once grants.
 -- Requires DataStore API access (or set USE_LEDGER = false for pure local testing).
-local HttpService = game:GetService("HttpService")
-local Players = game:GetService("Players")
-local ReplicatedStorage = game:GetService("ReplicatedStorage")
-local RazorMarket = require(ReplicatedStorage:WaitForChild("RazorMarket"))
+HttpService = use "HttpService"
+Players = use "Players"
+RazorMarket = use "razormarket"
 
 local TEST_PRODUCT = 0 -- replace with a real developer product id
 local TEST_PASS = 0 -- replace with a real game pass id

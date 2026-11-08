@@ -1,4 +1,6 @@
 --!strict
+--!native
+--!optimize 2
 --[[
 	RazorMarket
 	Centralized, fail-safe MarketplaceService handling.
