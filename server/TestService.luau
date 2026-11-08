@@ -5,8 +5,8 @@ HttpService = use "HttpService"
 Players = use "Players"
 RazorMarket = use "razormarket"
 
-local TEST_PRODUCT = 0 -- replace with a real developer product id
-local TEST_PASS = 0 -- replace with a real game pass id
+local TEST_PRODUCT = 3729815949 -- replace with a real developer product id
+local TEST_PASS = 2075908399 -- replace with a real game pass id
 local USE_LEDGER = true
 
 -- Stand-in for the player's saved profile. In a real game this is your DataStore profile,
