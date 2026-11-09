@@ -23,7 +23,12 @@
 	    window.
 	  * Game pass handlers run on EVERY join (and on in-game purchase) and must be safe to repeat.
 
-	Not covered: subscriptions (ProcessReceipt is not used for them).
+	Subscriptions (ProcessReceipt is NOT used for them):
+	  * Status is queried with MarketplaceService:GetUserSubscriptionStatusAsync on join, and
+	    kept fresh via Players.UserSubscriptionStatusChanged (fires on purchase, cancel, lapse).
+	  * Subscription handlers receive the full status on EVERY join and on EVERY change, so
+	    they can both grant AND revoke perks. They must be safe to repeat.
+	  * Do NOT persist subscription perks permanently; always derive them from current status.
 ]]
 
 local DataStoreService = game:GetService("DataStoreService")
@@ -40,9 +45,16 @@ export type Receipt = {
 	CurrencyType: Enum.CurrencyType,
 }
 
+export type SubscriptionStatus = {
+	IsSubscribed: boolean,
+	IsRenewing: boolean,
+}
+
 -- Return true ONLY if the grant succeeded and is saved. Errors/false => retried later.
 export type ProductHandler = (player: Player, receipt: Receipt) -> boolean
 export type PassHandler = (player: Player, passId: number) -> ()
+-- Called on join and whenever the status changes. Check status.IsSubscribed to grant/revoke.
+export type SubscriptionHandler = (player: Player, subscriptionId: string, status: SubscriptionStatus) -> ()
 export type Logger = (level: string, message: string) -> ()
 
 export type Config = {
@@ -91,6 +103,8 @@ local productHandlers: { [number]: ProductHandler } = {}
 local defaultProductHandler: ProductHandler? = nil
 local passHandlers: { [number]: { PassHandler } } = {}
 local passCache: { [number]: { [number]: boolean } } = {}
+local subscriptionHandlers: { [string]: { SubscriptionHandler } } = {}
+local subscriptionCache: { [number]: { [string]: SubscriptionStatus } } = {}
 local connectedUsers: { [number]: boolean } = {}
 local inFlight: { [string]: boolean } = {}
 local grantedThisServer: { [string]: boolean } = {}
@@ -400,6 +414,90 @@ function RazorMarket.InvalidatePass(player: Player, passId: number?)
 	end
 end
 
+--[=[
+	Full subscription status with retries + per-player cache.
+	Returns nil if Roblox could not be reached (failures are not cached).
+]=]
+function RazorMarket.GetSubscriptionStatus(player: Player, subscriptionId: string): SubscriptionStatus?
+	local cache = subscriptionCache[player.UserId]
+	if cache and cache[subscriptionId] ~= nil then
+		return cache[subscriptionId]
+	end
+	local ok, result = retry(`GetUserSubscriptionStatusAsync({subscriptionId})`, function()
+		return MarketplaceService:GetUserSubscriptionStatusAsync(player, subscriptionId)
+	end)
+	if not ok or type(result) ~= "table" then
+		return nil
+	end
+	local status: SubscriptionStatus = {
+		IsSubscribed = result.IsSubscribed == true,
+		IsRenewing = result.IsRenewing == true,
+	}
+	if connectedUsers[player.UserId] then
+		subscriptionCache[player.UserId] = subscriptionCache[player.UserId] or {}
+		subscriptionCache[player.UserId][subscriptionId] = status
+	end
+	return status
+end
+
+--[=[ True if the player currently has an active subscription. Lookup failures => false. ]=]
+function RazorMarket.IsSubscribed(player: Player, subscriptionId: string): boolean
+	local status = RazorMarket.GetSubscriptionStatus(player, subscriptionId)
+	return status ~= nil and status.IsSubscribed
+end
+
+--[=[ Forget cached subscription status. Omit subscriptionId to clear all for the player. ]=]
+function RazorMarket.InvalidateSubscription(player: Player, subscriptionId: string?)
+	if subscriptionId == nil then
+		subscriptionCache[player.UserId] = nil
+	elseif subscriptionCache[player.UserId] then
+		subscriptionCache[player.UserId][subscriptionId] = nil
+	end
+end
+
+local function fireSubscription(player: Player, subscriptionId: string, status: SubscriptionStatus)
+	for _, handler in subscriptionHandlers[subscriptionId] or {} do
+		local ok, err = pcall(handler, player, subscriptionId, status)
+		if not ok then
+			logger("error", `Subscription {subscriptionId} handler errored: {err}`)
+		end
+	end
+end
+
+local function refreshSubscription(player: Player, subscriptionId: string)
+	RazorMarket.InvalidateSubscription(player, subscriptionId)
+	local status = RazorMarket.GetSubscriptionStatus(player, subscriptionId)
+	if status and connectedUsers[player.UserId] then
+		fireSubscription(player, subscriptionId, status)
+	elseif not status then
+		logger("warn", `Could not fetch subscription {subscriptionId} for {player.Name}; handlers not fired`)
+	end
+end
+
+--[=[
+	Called with the current status on EVERY join and whenever it changes (purchase, cancel,
+	expiry). Grant perks when status.IsSubscribed is true, revoke them when false.
+	Handlers must be safe to run repeatedly.
+]=]
+function RazorMarket.HandleSubscription(subscriptionId: string, handler: SubscriptionHandler)
+	local list = subscriptionHandlers[subscriptionId] or {}
+	subscriptionHandlers[subscriptionId] = list
+	table.insert(list, handler)
+	if started then
+		for _, player in Players:GetPlayers() do
+			task.spawn(function()
+				local status = RazorMarket.GetSubscriptionStatus(player, subscriptionId)
+				if status and connectedUsers[player.UserId] then
+					local ok, err = pcall(handler, player, subscriptionId, status)
+					if not ok then
+						logger("error", `Subscription {subscriptionId} handler errored: {err}`)
+					end
+				end
+			end)
+		end
+	end
+end
+
 function RazorMarket.PromptProduct(player: Player, productId: number)
 	MarketplaceService:PromptProductPurchase(player, productId)
 end
@@ -409,6 +507,14 @@ function RazorMarket.PromptGamePass(player: Player, passId: number)
 		return
 	end
 	MarketplaceService:PromptGamePassPurchase(player, passId)
+end
+
+--[=[ Prompts a subscription purchase unless the player is already subscribed. ]=]
+function RazorMarket.PromptSubscription(player: Player, subscriptionId: string)
+	if RazorMarket.IsSubscribed(player, subscriptionId) then
+		return
+	end
+	MarketplaceService:PromptSubscriptionPurchase(player, subscriptionId)
 end
 
 local infoCache: { [string]: any } = {}
@@ -455,6 +561,7 @@ function RazorMarket.Start()
 	Players.PlayerRemoving:Connect(function(player)
 		connectedUsers[player.UserId] = nil
 		passCache[player.UserId] = nil
+		subscriptionCache[player.UserId] = nil
 	end)
 
 	MarketplaceService.ProcessReceipt = function(receiptInfo: { [string]: any })
@@ -472,11 +579,28 @@ function RazorMarket.Start()
 		firePass(player, passId)
 	end)
 
+	-- Fires on purchase, cancellation and expiry. The event carries no status, so re-query.
+	Players.UserSubscriptionStatusChanged:Connect(function(player: Player, subscriptionId: string)
+		if subscriptionHandlers[subscriptionId] then
+			task.spawn(refreshSubscription, player, subscriptionId)
+		else
+			RazorMarket.InvalidateSubscription(player, subscriptionId)
+		end
+	end)
+
 	local function onPlayer(player: Player)
 		for passId in passHandlers do
 			task.spawn(function()
 				if RazorMarket.OwnsGamePass(player, passId) then
 					firePass(player, passId)
+				end
+			end)
+		end
+		for subscriptionId in subscriptionHandlers do
+			task.spawn(function()
+				local status = RazorMarket.GetSubscriptionStatus(player, subscriptionId)
+				if status and connectedUsers[player.UserId] then
+					fireSubscription(player, subscriptionId, status)
 				end
 			end)
 		end
