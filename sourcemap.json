@@ -1,0 +1,71 @@
+{
+  "name": "pkg-razor-market",
+  "className": "DataModel",
+  "filePaths": [
+    "chain.toml"
+  ],
+  "children": [
+    {
+      "name": "Workspace",
+      "className": "Workspace"
+    },
+    {
+      "name": "ReplicatedStorage",
+      "className": "ReplicatedStorage",
+      "children": [
+        {
+          "name": "packages",
+          "className": "Folder",
+          "children": [
+            {
+              "name": "razormarket",
+              "className": "ModuleScript",
+              "filePaths": [
+                "src/init.luau"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ServerScriptService",
+      "className": "ServerScriptService",
+      "children": [
+        {
+          "name": "init",
+          "className": "Script",
+          "children": [
+            {
+              "name": "TestService",
+              "className": "ModuleScript",
+              "filePaths": [
+                "server/TestService.luau"
+              ]
+            }
+          ]
+        }
+      ]
+    },
+    {
+      "name": "ServerStorage",
+      "className": "ServerStorage"
+    },
+    {
+      "name": "StarterPlayer",
+      "className": "StarterPlayer",
+      "children": [
+        {
+          "name": "StarterPlayerScripts",
+          "className": "StarterPlayerScripts",
+          "children": [
+            {
+              "name": "init",
+              "className": "LocalScript"
+            }
+          ]
+        }
+      ]
+    }
+  ]
+}

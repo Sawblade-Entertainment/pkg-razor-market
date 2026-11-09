@@ -28,6 +28,8 @@
 	    kept fresh via Players.UserSubscriptionStatusChanged (fires on purchase, cancel, lapse).
 	  * Subscription handlers receive the full status on EVERY join and on EVERY change, so
 	    they can both grant AND revoke perks. They must be safe to repeat.
+	  * Each change re-queries the status; a lookup that started before the change is discarded,
+	    and handlers only ever see the newest status. Failed lookups are retried until they succeed.
 	  * Do NOT persist subscription perks permanently; always derive them from current status.
 ]]
 
@@ -35,6 +37,7 @@ local DataStoreService = game:GetService("DataStoreService")
 local MarketplaceService = game:GetService("MarketplaceService")
 local Players = game:GetService("Players")
 local RunService = game:GetService("RunService")
+local DataModel = game -- like the services above, swapped for a fake by RazorMarket._useServices
 
 export type Receipt = {
 	PurchaseId: string,
@@ -71,6 +74,7 @@ export type Config = {
 	-- Return true if this PurchaseId is already recorded in the player's saved profile.
 	-- Errors are treated as "unknown" and the receipt is retried later.
 	IsAlreadyGranted: ((player: Player, purchaseId: string) -> boolean)?,
+	-- Errors thrown by the Logger are caught and the line is sent to warn() instead.
 	Logger: Logger?,
 }
 
@@ -104,7 +108,24 @@ local defaultProductHandler: ProductHandler? = nil
 local passHandlers: { [number]: { PassHandler } } = {}
 local passCache: { [number]: { [number]: boolean } } = {}
 local subscriptionHandlers: { [string]: { SubscriptionHandler } } = {}
-local subscriptionCache: { [number]: { [string]: SubscriptionStatus } } = {}
+
+-- A pending handler run for one player/subscription. A newer sync replaces it.
+type SubscriptionSync = {
+	Handlers: { SubscriptionHandler }?, -- nil = every registered handler
+}
+
+type SubscriptionEntry = {
+	Status: SubscriptionStatus?,
+	-- Bumped on every invalidation; a fetch that started under an older generation is discarded.
+	Generation: number,
+	-- Threads waiting on the in-flight fetch, or nil when nothing is being fetched.
+	Waiting: { thread }?,
+	Sync: SubscriptionSync?,
+}
+
+-- Per connected player; replaced on rejoin so lookups from an earlier session can't write into it.
+local subscriptionState: { [number]: { [string]: SubscriptionEntry } } = {}
+local MAX_RESYNC_DELAY = 60
 local connectedUsers: { [number]: boolean } = {}
 local inFlight: { [string]: boolean } = {}
 local grantedThisServer: { [string]: boolean } = {}
@@ -124,6 +145,13 @@ local function retry(label: string, fn: () -> any): (boolean, any)
 		end
 	end
 	return false, lastErr
+end
+
+local function callHandler(label: string, handler: (...any) -> ...any, ...: any)
+	local ok, err = pcall(handler, ...)
+	if not ok then
+		logger("error", `{label} handler errored: {err}`)
+	end
 end
 
 local function noteLedgerFailure(err: any)
@@ -177,7 +205,7 @@ local function claim(receipt: Receipt): string
 			if
 				old
 				and old.Status == "claimed"
-				and old.JobId ~= game.JobId
+				and old.JobId ~= DataModel.JobId
 				and (os.time() - (old.At or 0)) < claimTimeout
 			then
 				outcome = "busy"
@@ -186,7 +214,7 @@ local function claim(receipt: Receipt): string
 			outcome = "proceed"
 			return {
 				Status = "claimed",
-				JobId = game.JobId,
+				JobId = DataModel.JobId,
 				At = os.time(),
 				ProductId = receipt.ProductId,
 			}
@@ -213,9 +241,12 @@ local function writeStatus(receipt: Receipt, status: string): boolean
 			if old and old.Status == "granted" then
 				return nil -- never downgrade a granted record
 			end
+			if status == "released" and old and old.Status == "claimed" and old.JobId ~= DataModel.JobId then
+				return nil -- our claim expired and another server took over; its claim stands
+			end
 			return {
 				Status = status,
-				JobId = game.JobId,
+				JobId = DataModel.JobId,
 				At = os.time(),
 				ProductId = receipt.ProductId,
 			}
@@ -332,7 +363,14 @@ function RazorMarket.Configure(config: Config)
 	shutdownWait = config.ShutdownWait or shutdownWait
 	isAlreadyGranted = config.IsAlreadyGranted or isAlreadyGranted
 	if config.Logger then
-		logger = config.Logger
+		-- A throwing Logger must not escape into the pipeline (e.g. leave a receipt locked).
+		local custom = config.Logger
+		logger = function(level, message)
+			local ok, err = pcall(custom, level, message)
+			if not ok then
+				warn(`[RazorMarket] Logger errored: {err} (while logging {level}: {message})`)
+			end
+		end
 	end
 end
 
@@ -363,10 +401,7 @@ function RazorMarket.HandleGamePass(passId: number, handler: PassHandler)
 		for _, player in Players:GetPlayers() do
 			task.spawn(function()
 				if RazorMarket.OwnsGamePass(player, passId) then
-					local ok, err = pcall(handler, player, passId)
-					if not ok then
-						logger("error", `Game pass {passId} handler errored: {err}`)
-					end
+					callHandler(`Game pass {passId}`, handler, player, passId)
 				end
 			end)
 		end
@@ -375,10 +410,7 @@ end
 
 local function firePass(player: Player, passId: number)
 	for _, handler in passHandlers[passId] or {} do
-		local ok, err = pcall(handler, player, passId)
-		if not ok then
-			logger("error", `Game pass {passId} handler errored: {err}`)
-		end
+		callHandler(`Game pass {passId}`, handler, player, passId)
 	end
 end
 
@@ -414,30 +446,76 @@ function RazorMarket.InvalidatePass(player: Player, passId: number?)
 	end
 end
 
---[=[
-	Full subscription status with retries + per-player cache.
-	Returns nil if Roblox could not be reached (failures are not cached).
-]=]
-function RazorMarket.GetSubscriptionStatus(player: Player, subscriptionId: string): SubscriptionStatus?
-	local cache = subscriptionCache[player.UserId]
-	if cache and cache[subscriptionId] ~= nil then
-		return cache[subscriptionId]
-	end
+local function fetchSubscriptionStatus(player: Player, subscriptionId: string): SubscriptionStatus?
 	local ok, result = retry(`GetUserSubscriptionStatusAsync({subscriptionId})`, function()
 		return MarketplaceService:GetUserSubscriptionStatusAsync(player, subscriptionId)
 	end)
 	if not ok or type(result) ~= "table" then
 		return nil
 	end
-	local status: SubscriptionStatus = {
+	return {
 		IsSubscribed = result.IsSubscribed == true,
 		IsRenewing = result.IsRenewing == true,
 	}
-	if connectedUsers[player.UserId] then
-		subscriptionCache[player.UserId] = subscriptionCache[player.UserId] or {}
-		subscriptionCache[player.UserId][subscriptionId] = status
+end
+
+local function getSubscriptionEntry(userId: number, subscriptionId: string): SubscriptionEntry?
+	local entries = subscriptionState[userId]
+	if not entries then
+		return nil
 	end
-	return status
+	local entry = entries[subscriptionId]
+	if not entry then
+		entry = { Generation = 0 }
+		entries[subscriptionId] = entry
+	end
+	return entry
+end
+
+local function isCurrentEntry(userId: number, subscriptionId: string, entry: SubscriptionEntry): boolean
+	local entries = subscriptionState[userId]
+	return entries ~= nil and entries[subscriptionId] == entry
+end
+
+--[=[
+	Full subscription status with retries + per-player cache. Concurrent lookups share one request.
+	Returns nil if Roblox could not be reached (failures are not cached). Returns a copy.
+]=]
+function RazorMarket.GetSubscriptionStatus(player: Player, subscriptionId: string): SubscriptionStatus?
+	local entry = getSubscriptionEntry(player.UserId, subscriptionId)
+	if not entry then
+		-- Not tracked (left, or Start() not called yet): uncached lookup.
+		return fetchSubscriptionStatus(player, subscriptionId)
+	end
+	while true do
+		if entry.Status then
+			return table.clone(entry.Status)
+		end
+		local status: SubscriptionStatus?
+		local stale: boolean
+		local waiting = entry.Waiting
+		if waiting then
+			table.insert(waiting, coroutine.running())
+			status, stale = coroutine.yield()
+		else
+			local generation = entry.Generation
+			local waiters: { thread } = {}
+			entry.Waiting = waiters
+			status = fetchSubscriptionStatus(player, subscriptionId)
+			entry.Waiting = nil
+			-- Invalidated while in flight: the answer may predate the change, so ask again.
+			stale = entry.Generation ~= generation and isCurrentEntry(player.UserId, subscriptionId, entry)
+			if status and not stale then
+				entry.Status = status
+			end
+			for _, thread in waiters do
+				task.spawn(thread, status, stale)
+			end
+		end
+		if not stale then
+			return if status then table.clone(status) else nil
+		end
+	end
 end
 
 --[=[ True if the player currently has an active subscription. Lookup failures => false. ]=]
@@ -446,38 +524,67 @@ function RazorMarket.IsSubscribed(player: Player, subscriptionId: string): boole
 	return status ~= nil and status.IsSubscribed
 end
 
---[=[ Forget cached subscription status. Omit subscriptionId to clear all for the player. ]=]
+--[=[
+	Forget cached subscription status. Omit subscriptionId to clear all for the player.
+	Lookups already in flight are re-run instead of caching a possibly outdated answer.
+]=]
 function RazorMarket.InvalidateSubscription(player: Player, subscriptionId: string?)
-	if subscriptionId == nil then
-		subscriptionCache[player.UserId] = nil
-	elseif subscriptionCache[player.UserId] then
-		subscriptionCache[player.UserId][subscriptionId] = nil
-	end
-end
-
-local function fireSubscription(player: Player, subscriptionId: string, status: SubscriptionStatus)
-	for _, handler in subscriptionHandlers[subscriptionId] or {} do
-		local ok, err = pcall(handler, player, subscriptionId, status)
-		if not ok then
-			logger("error", `Subscription {subscriptionId} handler errored: {err}`)
+	for id, entry in subscriptionState[player.UserId] or {} do
+		if subscriptionId == nil or id == subscriptionId then
+			entry.Status = nil
+			entry.Generation += 1
 		end
 	end
 end
 
-local function refreshSubscription(player: Player, subscriptionId: string)
-	RazorMarket.InvalidateSubscription(player, subscriptionId)
-	local status = RazorMarket.GetSubscriptionStatus(player, subscriptionId)
-	if status and connectedUsers[player.UserId] then
-		fireSubscription(player, subscriptionId, status)
-	elseif not status then
-		logger("warn", `Could not fetch subscription {subscriptionId} for {player.Name}; handlers not fired`)
+-- Fetches the status and runs handlers with it, retrying until it succeeds, the player leaves, or
+-- a newer sync for the same subscription takes over (so an older status never lands after a newer
+-- one). Passing `handler` limits the run to that one newly registered handler.
+local function syncSubscription(player: Player, subscriptionId: string, handler: SubscriptionHandler?)
+	local entry = getSubscriptionEntry(player.UserId, subscriptionId)
+	if not entry then
+		return
+	end
+	local active = entry.Sync
+	if handler and active then
+		-- A run is already pending; it picks this handler up.
+		if active.Handlers then
+			table.insert(active.Handlers, handler)
+		end
+		return
+	end
+	local sync: SubscriptionSync = { Handlers = if handler then { handler } else nil }
+	entry.Sync = sync
+	local function superseded(): boolean
+		return entry.Sync ~= sync or not isCurrentEntry(player.UserId, subscriptionId, entry)
+	end
+
+	local delay = math.min(retryDelay * 2 ^ maxRetries, MAX_RESYNC_DELAY)
+	while true do
+		local status = RazorMarket.GetSubscriptionStatus(player, subscriptionId)
+		if superseded() then
+			return
+		end
+		if status then
+			entry.Sync = nil
+			for _, h in sync.Handlers or subscriptionHandlers[subscriptionId] or {} do
+				callHandler(`Subscription {subscriptionId}`, h, player, subscriptionId, table.clone(status))
+			end
+			return
+		end
+		logger("warn", `Could not fetch subscription {subscriptionId} for {player.Name}; retrying in {delay}s`)
+		task.wait(delay)
+		if superseded() then
+			return
+		end
+		delay = math.min(delay * 2, MAX_RESYNC_DELAY)
 	end
 end
 
 --[=[
 	Called with the current status on EVERY join and whenever it changes (purchase, cancel,
 	expiry). Grant perks when status.IsSubscribed is true, revoke them when false.
-	Handlers must be safe to run repeatedly.
+	Handlers must be safe to run repeatedly. Failed lookups are retried until they succeed.
 ]=]
 function RazorMarket.HandleSubscription(subscriptionId: string, handler: SubscriptionHandler)
 	local list = subscriptionHandlers[subscriptionId] or {}
@@ -485,15 +592,7 @@ function RazorMarket.HandleSubscription(subscriptionId: string, handler: Subscri
 	table.insert(list, handler)
 	if started then
 		for _, player in Players:GetPlayers() do
-			task.spawn(function()
-				local status = RazorMarket.GetSubscriptionStatus(player, subscriptionId)
-				if status and connectedUsers[player.UserId] then
-					local ok, err = pcall(handler, player, subscriptionId, status)
-					if not ok then
-						logger("error", `Subscription {subscriptionId} handler errored: {err}`)
-					end
-				end
-			end)
+			task.spawn(syncSubscription, player, subscriptionId, handler)
 		end
 	end
 end
@@ -509,9 +608,14 @@ function RazorMarket.PromptGamePass(player: Player, passId: number)
 	MarketplaceService:PromptGamePassPurchase(player, passId)
 end
 
---[=[ Prompts a subscription purchase unless the player is already subscribed. ]=]
+--[=[
+	Prompts a subscription purchase unless the player is known to be subscribed. Doesn't yield:
+	it only checks the cached status (filled on join for subscriptions with handlers).
+]=]
 function RazorMarket.PromptSubscription(player: Player, subscriptionId: string)
-	if RazorMarket.IsSubscribed(player, subscriptionId) then
+	local entries = subscriptionState[player.UserId]
+	local entry = entries and entries[subscriptionId]
+	if entry and entry.Status and entry.Status.IsSubscribed then
 		return
 	end
 	MarketplaceService:PromptSubscriptionPurchase(player, subscriptionId)
@@ -552,16 +656,19 @@ function RazorMarket.Start()
 		)
 	end
 
-	for _, player in Players:GetPlayers() do
+	-- Idempotent; also called from onPlayer since PlayerAdded connection order isn't guaranteed.
+	local function track(player: Player)
 		connectedUsers[player.UserId] = true
+		subscriptionState[player.UserId] = subscriptionState[player.UserId] or {}
 	end
-	Players.PlayerAdded:Connect(function(player)
-		connectedUsers[player.UserId] = true
-	end)
+	for _, player in Players:GetPlayers() do
+		track(player)
+	end
+	Players.PlayerAdded:Connect(track)
 	Players.PlayerRemoving:Connect(function(player)
 		connectedUsers[player.UserId] = nil
 		passCache[player.UserId] = nil
-		subscriptionCache[player.UserId] = nil
+		subscriptionState[player.UserId] = nil
 	end)
 
 	MarketplaceService.ProcessReceipt = function(receiptInfo: { [string]: any })
@@ -581,14 +688,14 @@ function RazorMarket.Start()
 
 	-- Fires on purchase, cancellation and expiry. The event carries no status, so re-query.
 	Players.UserSubscriptionStatusChanged:Connect(function(player: Player, subscriptionId: string)
+		RazorMarket.InvalidateSubscription(player, subscriptionId)
 		if subscriptionHandlers[subscriptionId] then
-			task.spawn(refreshSubscription, player, subscriptionId)
-		else
-			RazorMarket.InvalidateSubscription(player, subscriptionId)
+			task.spawn(syncSubscription, player, subscriptionId)
 		end
 	end)
 
 	local function onPlayer(player: Player)
+		track(player)
 		for passId in passHandlers do
 			task.spawn(function()
 				if RazorMarket.OwnsGamePass(player, passId) then
@@ -597,12 +704,7 @@ function RazorMarket.Start()
 			end)
 		end
 		for subscriptionId in subscriptionHandlers do
-			task.spawn(function()
-				local status = RazorMarket.GetSubscriptionStatus(player, subscriptionId)
-				if status and connectedUsers[player.UserId] then
-					fireSubscription(player, subscriptionId, status)
-				end
-			end)
+			task.spawn(syncSubscription, player, subscriptionId)
 		end
 	end
 	Players.PlayerAdded:Connect(onPlayer)
@@ -610,7 +712,7 @@ function RazorMarket.Start()
 		task.spawn(onPlayer, player)
 	end
 
-	game:BindToClose(function()
+	DataModel:BindToClose(function()
 		local deadline = os.clock() + shutdownWait
 		while inFlightCount > 0 and os.clock() < deadline do
 			task.wait(0.1)
@@ -624,6 +726,20 @@ end
 --[=[ Exposed for tests only. Runs the real ProcessReceipt pipeline on a fake receipt. ]=]
 function RazorMarket._processReceipt(receipt: Receipt): Enum.ProductPurchaseDecision
 	return processReceipt(receipt)
+end
+
+--[=[
+	Exposed for tests only. Swaps Roblox services for fakes (DataStoreService, MarketplaceService,
+	Players, RunService, DataModel); omitted ones stay real. Call before Start() on a fresh copy of
+	the module (require a Clone()), since module state is never reset.
+]=]
+function RazorMarket._useServices(services: { [string]: any })
+	assert(not started, "RazorMarket._useServices must be called before Start")
+	DataStoreService = services.DataStoreService or DataStoreService
+	MarketplaceService = services.MarketplaceService or MarketplaceService
+	Players = services.Players or Players
+	RunService = services.RunService or RunService
+	DataModel = services.DataModel or DataModel
 end
 
 return RazorMarket

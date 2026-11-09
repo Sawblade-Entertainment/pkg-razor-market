@@ -8,6 +8,7 @@ Centralized, fail-safe `MarketplaceService` handling for Roblox. RazorMarket is 
 - [Configuration](#configuration)
 - [API reference](#api-reference)
 - [Game passes](#game-passes)
+- [Subscriptions](#subscriptions)
 - [Studio and testing](#studio-and-testing)
 - [Failure behavior](#failure-behavior)
 - [Limitations](#limitations)
@@ -45,6 +46,10 @@ RazorMarket.HandleGamePass(987654, function(player, passId)
 	grantVipPerks(player) -- must be safe to run on every join
 end)
 
+RazorMarket.HandleSubscription("EXP-0000000000000000000", function(player, subscriptionId, status)
+	setMemberPerks(player, status.IsSubscribed) -- grant AND revoke; runs on join and every change
+end)
+
 RazorMarket.Start()
 ```
 
@@ -71,7 +76,7 @@ Never set `MarketplaceService.ProcessReceipt` anywhere else. Roblox allows only 
 4. Run your handler. Error or non-`true` result releases the claim and returns `NotProcessedYet`.
 5. Mark the ledger `granted`, then return `PurchaseGranted`. A `granted` record is never downgraded.
 
-Ledger entries are keyed `{PlayerId}_{PurchaseId}` in the DataStore `RazorMarket_PurchaseLedger_v1` and look like `{ Status, JobId, At, ProductId }` where `Status` is `claimed`, `granted` or `released`.
+Ledger entries are keyed by `PurchaseId` in the DataStore `RazorMarket_PurchaseLedger_v1` and look like `{ Status, JobId, At, ProductId }` where `Status` is `claimed`, `granted` or `released`.
 
 ## Handler requirements (read this)
 
@@ -114,6 +119,13 @@ export type Receipt = {
 
 export type ProductHandler = (player: Player, receipt: Receipt) -> boolean
 export type PassHandler = (player: Player, passId: number) -> ()
+
+export type SubscriptionStatus = {
+	IsSubscribed: boolean,
+	IsRenewing: boolean,
+}
+
+export type SubscriptionHandler = (player: Player, subscriptionId: string, status: SubscriptionStatus) -> ()
 ```
 
 ### `RazorMarket.Configure(config)`
@@ -134,20 +146,38 @@ Ownership check with retries and a per-player cache. Failed checks return `false
 ### `RazorMarket.InvalidatePass(player, passId?)`
 Clears cached ownership so the next `OwnsGamePass` re-queries Roblox. Omit `passId` to clear all of that player's passes. Use after a possible website purchase mid-session.
 
+### `RazorMarket.HandleSubscription(subscriptionId, handler)`
+Registers a handler called with the player's current status on every join and whenever the status changes (purchase, cancellation, expiry). Grant perks when `status.IsSubscribed` is `true` and revoke them when it is `false`. Multiple handlers per subscription are allowed and must be safe to run repeatedly. If registered after `Start()`, it runs for players already in the server.
+
+### `RazorMarket.GetSubscriptionStatus(player, subscriptionId): SubscriptionStatus?`
+Status lookup with retries and a per-player cache. Concurrent lookups for the same player and subscription share one request. Returns `nil` if Roblox could not be reached (not cached). The returned table is a copy, so changing it doesn't affect the cache.
+
+### `RazorMarket.IsSubscribed(player, subscriptionId): boolean`
+`true` if the player has an active subscription. A failed lookup returns `false`.
+
+### `RazorMarket.InvalidateSubscription(player, subscriptionId?)`
+Clears the cached status so the next lookup re-queries Roblox. Omit `subscriptionId` to clear all of that player's subscriptions. Lookups already in flight are re-run rather than cached. RazorMarket calls this itself when `UserSubscriptionStatusChanged` fires.
+
 ### `RazorMarket.PromptProduct(player, productId)`
 Prompts a developer product purchase.
 
 ### `RazorMarket.PromptGamePass(player, passId)`
 Prompts a game pass purchase, skipped if the player already owns it.
 
+### `RazorMarket.PromptSubscription(player, subscriptionId)`
+Prompts a subscription purchase, skipped if the cached status says the player is already subscribed. Never yields: if the status isn't cached yet (it is fetched on join for subscriptions with a handler), it prompts straight away.
+
 ### `RazorMarket.GetProductInfo(id, infoType?): any?`
 `MarketplaceService:GetProductInfo` with retries and caching. `infoType` defaults to `Enum.InfoType.Product`. Returns `nil` on failure (not cached).
 
 ### `RazorMarket.Start()`
-Server only. Takes ownership of `ProcessReceipt`, wires game pass events and player tracking, and registers the `BindToClose` wait. Idempotent.
+Server only. Takes ownership of `ProcessReceipt`, wires game pass and subscription events and player tracking, and registers the `BindToClose` wait. Idempotent.
 
 ### `RazorMarket._processReceipt(receipt)`
 Test hook that runs the real receipt pipeline on a fake receipt. Do not call it in production code.
+
+### `RazorMarket._useServices(services)`
+Test hook that swaps `DataStoreService`, `MarketplaceService`, `Players`, `RunService` or `DataModel` for fakes. Call it before `Start()` on a fresh copy of the module (`require` a `Clone()`), since module state is never reset. Do not call it in production code.
 
 ## Game passes
 
@@ -155,6 +185,17 @@ Test hook that runs the real receipt pipeline on a fake receipt. Do not call it 
 - Buying a pass in-game updates the cache immediately and fires its handlers.
 - A pass bought on the website mid-session stays cached until the player rejoins, or until you call `InvalidatePass`.
 - Pass handlers run on **every** join, so make them idempotent.
+
+## Subscriptions
+
+Subscriptions don't go through `ProcessReceipt`. RazorMarket queries `GetUserSubscriptionStatusAsync` instead:
+
+- On every join, each registered subscription is looked up and its handlers get the status.
+- `Players.UserSubscriptionStatusChanged` (purchase, cancellation, expiry) clears the cache, re-queries and calls the handlers again.
+- A lookup that started before a change is discarded and re-run, and a newer refresh replaces an older one still in progress, so handlers never receive an outdated status after a newer one.
+- If a lookup fails on join or after a change, a warning is logged and it is retried with backoff (up to 60s apart) until it succeeds or the player leaves.
+- Handlers receive their own copy of the status.
+- Don't save subscription perks permanently. Always derive them from the current status.
 
 ## Studio and testing
 
@@ -166,14 +207,12 @@ RazorMarket.Configure({ UseLedger = false })
 
 `Start()` warns loudly when the ledger is disabled. Never ship with it off.
 
-The harness in `server/TestService.luau` runs fake receipts through `_processReceipt` and asserts that:
+The harness in `server/TestService.luau` runs two suites when you press Play:
 
-1. The first delivery grants.
-2. A duplicate returns `PurchaseGranted` without re-granting.
-3. Concurrent duplicates grant exactly once.
-4. An unknown product returns `NotProcessedYet`.
+1. **Unit suite** (once, on server start): every test gets a fresh copy of the package wired to in-memory fakes of `MarketplaceService`, `DataStoreService`, `Players`, `RunService` and the `DataModel` (via the `_useServices` test hook). It covers outages, retries, races between servers, subscriptions and shutdown, and needs no DataStore access or real players.
+2. **Live suite** (for each player who joins): runs fake receipts through `_processReceipt` against the real services and checks that the first delivery grants, a duplicate returns `PurchaseGranted` without re-granting, concurrent duplicates grant exactly once, and an unknown product returns `NotProcessedYet`. It needs DataStore API access, or set `USE_LEDGER = false` in the harness.
 
-Replace the placeholder product and pass IDs (`0`) with real ones before running it.
+Set `TEST_PRODUCT` and `TEST_PASS` at the top of the harness to a developer product and game pass from your own experience.
 
 ## Failure behavior
 
@@ -181,7 +220,7 @@ Replace the placeholder product and pass IDs (`0`) with real ones before running
 | --- | --- |
 | Player left the server | `NotProcessedYet`, retried when they rejoin |
 | No handler for the product | Error logged, `NotProcessedYet` |
-| Handler errors or returns non-`true` | Claim released, `NotProcessedYet` |
+| Handler errors or returns non-`true` | Claim released (unless another server has since taken it over), `NotProcessedYet` |
 | `IsAlreadyGranted` errors | `NotProcessedYet` |
 | Ledger unavailable | One error logged, `NotProcessedYet` |
 | Another server holds a live claim | `NotProcessedYet` |
@@ -191,6 +230,5 @@ Replace the placeholder product and pass IDs (`0`) with real ones before running
 
 ## Limitations
 
-- Subscriptions are not covered (`ProcessReceipt` is not used for them).
 - Exactly-once across servers depends on your handler saving `PurchaseId` with the item. The library cannot do this for you.
 - Handlers that take longer than `ClaimTimeout` may let another server take over the claim, so keep grants fast.
