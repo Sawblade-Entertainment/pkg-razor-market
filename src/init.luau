@@ -29,7 +29,8 @@
 	  * Subscription handlers receive the full status on EVERY join and on EVERY change, so
 	    they can both grant AND revoke perks. They must be safe to repeat.
 	  * Each change re-queries the status; a lookup that started before the change is discarded,
-	    and handlers only ever see the newest status. Failed lookups are retried until they succeed.
+	    and handlers only ever see the newest status. Failed lookups are retried with backoff; after
+	    MAX_RESYNC_ROUNDS failures in a row the sync gives up until the next change or join.
 	  * Do NOT persist subscription perks permanently; always derive them from current status.
 ]]
 
@@ -109,23 +110,28 @@ local passHandlers: { [number]: { PassHandler } } = {}
 local passCache: { [number]: { [number]: boolean } } = {}
 local subscriptionHandlers: { [string]: { SubscriptionHandler } } = {}
 
--- A pending handler run for one player/subscription. A newer sync replaces it.
-type SubscriptionSync = {
+-- A sync whose lookup is still in flight. Handlers registered meanwhile join it instead of
+-- starting another lookup.
+type PendingSync = {
 	Handlers: { SubscriptionHandler }?, -- nil = every registered handler
 }
 
 type SubscriptionEntry = {
 	Status: SubscriptionStatus?,
-	-- Bumped on every invalidation; a fetch that started under an older generation is discarded.
+	-- Bumped on every invalidation. A lookup or handler run that started under an older generation
+	-- is discarded, so an outdated status never lands after a newer one.
 	Generation: number,
-	-- Threads waiting on the in-flight fetch, or nil when nothing is being fetched.
+	-- Threads waiting on the in-flight lookup, or nil when nothing is being fetched.
 	Waiting: { thread }?,
-	Sync: SubscriptionSync?,
+	Pending: PendingSync?,
 }
 
 -- Per connected player; replaced on rejoin so lookups from an earlier session can't write into it.
 local subscriptionState: { [number]: { [string]: SubscriptionEntry } } = {}
 local MAX_RESYNC_DELAY = 60
+-- Failed lookups a sync tolerates (with backoff between them) before it gives up until the next
+-- status change or join, so a wrong subscription id doesn't poll Roblox forever.
+local MAX_RESYNC_ROUNDS = 5
 local connectedUsers: { [number]: boolean } = {}
 local inFlight: { [string]: boolean } = {}
 local grantedThisServer: { [string]: boolean } = {}
@@ -500,16 +506,29 @@ function RazorMarket.GetSubscriptionStatus(player: Player, subscriptionId: strin
 		else
 			local generation = entry.Generation
 			local waiters: { thread } = {}
+			local done = false
 			entry.Waiting = waiters
-			status = fetchSubscriptionStatus(player, subscriptionId)
-			entry.Waiting = nil
-			-- Invalidated while in flight: the answer may predate the change, so ask again.
-			stale = entry.Generation ~= generation and isCurrentEntry(player.UserId, subscriptionId, entry)
-			if status and not stale then
-				entry.Status = status
-			end
-			for _, thread in waiters do
-				task.spawn(thread, status, stale)
+			-- The request runs in a thread of its own: if it ran in the caller's thread, cancelling
+			-- that thread (task.cancel, a promise timeout) would leave Waiting set forever.
+			task.spawn(function()
+				status = fetchSubscriptionStatus(player, subscriptionId)
+				entry.Waiting = nil
+				-- Invalidated while in flight: the answer may predate the change, so ask again.
+				stale = entry.Generation ~= generation and isCurrentEntry(player.UserId, subscriptionId, entry)
+				if status and not stale then
+					entry.Status = status
+				end
+				done = true
+				for _, thread in waiters do
+					-- A waiter cancelled meanwhile is dead; resuming it would throw and strand the rest.
+					if coroutine.status(thread) == "suspended" then
+						task.spawn(thread, status, stale)
+					end
+				end
+			end)
+			if not done then
+				table.insert(waiters, coroutine.running())
+				status, stale = coroutine.yield()
 			end
 		end
 		if not stale then
@@ -524,67 +543,90 @@ function RazorMarket.IsSubscribed(player: Player, subscriptionId: string): boole
 	return status ~= nil and status.IsSubscribed
 end
 
+-- Fetches the status and runs handlers with it. Failed lookups are retried with backoff. The sync
+-- stops when the player leaves or the status is invalidated (the sync started by the invalidation
+-- takes over, so an older status never lands after a newer one), and gives up after
+-- MAX_RESYNC_ROUNDS failed lookups. Passing `handler` limits the run to that one newly registered
+-- handler.
+local function syncSubscription(player: Player, subscriptionId: string, handler: SubscriptionHandler?)
+	local entry = getSubscriptionEntry(player.UserId, subscriptionId)
+	if not entry then
+		return
+	end
+	local pending = entry.Pending
+	if handler and pending then
+		-- A lookup is already in flight; its sync picks this handler up.
+		if pending.Handlers then
+			table.insert(pending.Handlers, handler)
+		end
+		return
+	end
+	pending = { Handlers = if handler then { handler } else nil }
+	entry.Pending = pending
+	local generation = entry.Generation
+	local function current(): boolean
+		return entry.Generation == generation and isCurrentEntry(player.UserId, subscriptionId, entry)
+	end
+
+	local delay = math.min(retryDelay * 2 ^ maxRetries, MAX_RESYNC_DELAY)
+	for round = 1, MAX_RESYNC_ROUNDS do
+		local status = RazorMarket.GetSubscriptionStatus(player, subscriptionId)
+		if not current() then
+			return
+		end
+		if status then
+			-- Handlers registered from here on start their own sync, so snapshot the list.
+			entry.Pending = nil
+			for _, h in table.clone(pending.Handlers or subscriptionHandlers[subscriptionId] or {}) do
+				-- Handlers may yield; a status that changed meanwhile is delivered by the newer sync.
+				if not current() then
+					return
+				end
+				callHandler(`Subscription {subscriptionId}`, h, player, subscriptionId, table.clone(status))
+			end
+			return
+		end
+		if round < MAX_RESYNC_ROUNDS then
+			logger("warn", `Could not fetch subscription {subscriptionId} for {player.Name}; retrying in {delay}s`)
+			task.wait(delay)
+			if not current() then
+				return
+			end
+			delay = math.min(delay * 2, MAX_RESYNC_DELAY)
+		end
+	end
+	if entry.Pending == pending then
+		entry.Pending = nil
+	end
+	logger(
+		"error",
+		`Gave up on subscription {subscriptionId} for {player.Name} after {MAX_RESYNC_ROUNDS} failed lookups`
+			.. " (is the id right?); it will be retried on the next status change or join"
+	)
+end
+
 --[=[
 	Forget cached subscription status. Omit subscriptionId to clear all for the player.
-	Lookups already in flight are re-run instead of caching a possibly outdated answer.
+	Lookups already in flight are re-run instead of caching a possibly outdated answer, and
+	subscriptions with handlers are re-synced so the handlers see the fresh status.
 ]=]
 function RazorMarket.InvalidateSubscription(player: Player, subscriptionId: string?)
 	for id, entry in subscriptionState[player.UserId] or {} do
 		if subscriptionId == nil or id == subscriptionId then
 			entry.Status = nil
 			entry.Generation += 1
-		end
-	end
-end
-
--- Fetches the status and runs handlers with it, retrying until it succeeds, the player leaves, or
--- a newer sync for the same subscription takes over (so an older status never lands after a newer
--- one). Passing `handler` limits the run to that one newly registered handler.
-local function syncSubscription(player: Player, subscriptionId: string, handler: SubscriptionHandler?)
-	local entry = getSubscriptionEntry(player.UserId, subscriptionId)
-	if not entry then
-		return
-	end
-	local active = entry.Sync
-	if handler and active then
-		-- A run is already pending; it picks this handler up.
-		if active.Handlers then
-			table.insert(active.Handlers, handler)
-		end
-		return
-	end
-	local sync: SubscriptionSync = { Handlers = if handler then { handler } else nil }
-	entry.Sync = sync
-	local function superseded(): boolean
-		return entry.Sync ~= sync or not isCurrentEntry(player.UserId, subscriptionId, entry)
-	end
-
-	local delay = math.min(retryDelay * 2 ^ maxRetries, MAX_RESYNC_DELAY)
-	while true do
-		local status = RazorMarket.GetSubscriptionStatus(player, subscriptionId)
-		if superseded() then
-			return
-		end
-		if status then
-			entry.Sync = nil
-			for _, h in sync.Handlers or subscriptionHandlers[subscriptionId] or {} do
-				callHandler(`Subscription {subscriptionId}`, h, player, subscriptionId, table.clone(status))
+			if subscriptionHandlers[id] then
+				task.spawn(syncSubscription, player, id)
 			end
-			return
 		end
-		logger("warn", `Could not fetch subscription {subscriptionId} for {player.Name}; retrying in {delay}s`)
-		task.wait(delay)
-		if superseded() then
-			return
-		end
-		delay = math.min(delay * 2, MAX_RESYNC_DELAY)
 	end
 end
 
 --[=[
 	Called with the current status on EVERY join and whenever it changes (purchase, cancel,
 	expiry). Grant perks when status.IsSubscribed is true, revoke them when false.
-	Handlers must be safe to run repeatedly. Failed lookups are retried until they succeed.
+	Handlers must be safe to run repeatedly. Failed lookups are retried with backoff; after
+	MAX_RESYNC_ROUNDS failures in a row the sync gives up until the next change or join.
 ]=]
 function RazorMarket.HandleSubscription(subscriptionId: string, handler: SubscriptionHandler)
 	local list = subscriptionHandlers[subscriptionId] or {}
@@ -656,15 +698,6 @@ function RazorMarket.Start()
 		)
 	end
 
-	-- Idempotent; also called from onPlayer since PlayerAdded connection order isn't guaranteed.
-	local function track(player: Player)
-		connectedUsers[player.UserId] = true
-		subscriptionState[player.UserId] = subscriptionState[player.UserId] or {}
-	end
-	for _, player in Players:GetPlayers() do
-		track(player)
-	end
-	Players.PlayerAdded:Connect(track)
 	Players.PlayerRemoving:Connect(function(player)
 		connectedUsers[player.UserId] = nil
 		passCache[player.UserId] = nil
@@ -689,13 +722,11 @@ function RazorMarket.Start()
 	-- Fires on purchase, cancellation and expiry. The event carries no status, so re-query.
 	Players.UserSubscriptionStatusChanged:Connect(function(player: Player, subscriptionId: string)
 		RazorMarket.InvalidateSubscription(player, subscriptionId)
-		if subscriptionHandlers[subscriptionId] then
-			task.spawn(syncSubscription, player, subscriptionId)
-		end
 	end)
 
 	local function onPlayer(player: Player)
-		track(player)
+		connectedUsers[player.UserId] = true
+		subscriptionState[player.UserId] = subscriptionState[player.UserId] or {}
 		for passId in passHandlers do
 			task.spawn(function()
 				if RazorMarket.OwnsGamePass(player, passId) then

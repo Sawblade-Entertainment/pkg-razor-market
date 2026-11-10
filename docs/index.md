@@ -156,7 +156,7 @@ Status lookup with retries and a per-player cache. Concurrent lookups for the sa
 `true` if the player has an active subscription. A failed lookup returns `false`.
 
 ### `RazorMarket.InvalidateSubscription(player, subscriptionId?)`
-Clears the cached status so the next lookup re-queries Roblox. Omit `subscriptionId` to clear all of that player's subscriptions. Lookups already in flight are re-run rather than cached. RazorMarket calls this itself when `UserSubscriptionStatusChanged` fires.
+Clears the cached status so the next lookup re-queries Roblox. Omit `subscriptionId` to clear all of that player's subscriptions. Lookups already in flight are re-run rather than cached, and subscriptions that have handlers are re-queried and their handlers run again with the fresh status. RazorMarket calls this itself when `UserSubscriptionStatusChanged` fires.
 
 ### `RazorMarket.PromptProduct(player, productId)`
 Prompts a developer product purchase.
@@ -193,7 +193,8 @@ Subscriptions don't go through `ProcessReceipt`. RazorMarket queries `GetUserSub
 - On every join, each registered subscription is looked up and its handlers get the status.
 - `Players.UserSubscriptionStatusChanged` (purchase, cancellation, expiry) clears the cache, re-queries and calls the handlers again.
 - A lookup that started before a change is discarded and re-run, and a newer refresh replaces an older one still in progress, so handlers never receive an outdated status after a newer one.
-- If a lookup fails on join or after a change, a warning is logged and it is retried with backoff (up to 60s apart) until it succeeds or the player leaves.
+- If a lookup fails on join or after a change, a warning is logged and it is retried with backoff (up to 60s apart) until it succeeds or the player leaves. After five failed lookups in a row an error is logged and the sync gives up until the next status change or join, so a wrong subscription id doesn't poll Roblox forever.
+- `InvalidateSubscription` behaves like a status change: the subscription is re-queried and its handlers run again.
 - Handlers receive their own copy of the status.
 - Don't save subscription perks permanently. Always derive them from the current status.
 

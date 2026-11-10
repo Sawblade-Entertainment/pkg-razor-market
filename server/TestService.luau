@@ -1325,6 +1325,123 @@ test("subscription: handlers added while a handler-only sync is pending join it"
 	expectEqual(h.SubCalls, 1, "lookups")
 end)
 
+test("subscription: a sync gives up after repeated failed lookups", function(new)
+	local h = new({ Config = { RetryDelay = 0.01, MaxRetries = 1 } })
+	local calls, handler = recorder()
+	h.RM.HandleSubscription(SUB, handler)
+	h.RM.Start()
+	h.SubFailures = math.huge
+	local player = h:Join(1)
+	waitFor(function()
+		return h:Logged("error", `Gave up on subscription {SUB} for Fake1 after 5 failed lookups`)
+	end, "giving up")
+	expectEqual(h.SubCalls, 5, "lookups")
+	h.SubFailures = 0
+	task.wait(0.1)
+	expectEqual(h.SubCalls, 5, "lookups after giving up")
+	expectEqual(#calls, 0, "handler calls")
+	-- A status change starts over.
+	h.Players.UserSubscriptionStatusChanged:Fire(player, SUB)
+	waitFor(function()
+		return #calls == 1
+	end, "handler call after the change")
+end)
+
+test("subscription: a handler run is abandoned when a newer status arrives mid-run", function(new)
+	local h = new()
+	local gate = newGate()
+	local first, firstHandler = recorder()
+	local second, secondHandler = recorder()
+	local stalled = false
+	h.RM.HandleSubscription(SUB, function(...)
+		firstHandler(...)
+		if not stalled then
+			stalled = true
+			gate.Wait() -- the join-time call stalls, e.g. on a save
+		end
+	end)
+	h.RM.HandleSubscription(SUB, secondHandler)
+	h.RM.Start()
+	local player = h:Join(1)
+	waitFor(function()
+		return gate.Entered == 1
+	end, "first handler to stall")
+	h.Subscriptions[SUB] = SUBSCRIBED
+	h.Players.UserSubscriptionStatusChanged:Fire(player, SUB)
+	waitFor(function()
+		return #second == 1
+	end, "second handler with the new status")
+	gate.Open = true
+	task.wait(0.1)
+	expectEqual(#first, 2, "first handler calls")
+	expectEqual(#second, 1, "second handler calls (the stalled join sync must not continue)")
+	expectEqual(second[1][3].IsSubscribed, true, "IsSubscribed")
+end)
+
+test("subscription: InvalidateSubscription re-runs handlers with the fresh status", function(new)
+	local h = new()
+	local calls, handler = recorder()
+	h.RM.HandleSubscription(SUB, handler)
+	h.RM.Start()
+	local player = h:Join(1)
+	waitFor(function()
+		return #calls == 1
+	end, "join handler call")
+	h.Subscriptions[SUB] = SUBSCRIBED
+	h.RM.InvalidateSubscription(player)
+	waitFor(function()
+		return #calls == 2
+	end, "handler call after invalidation")
+	expectEqual(calls[2][3].IsSubscribed, true, "IsSubscribed")
+end)
+
+test("subscription: cancelled lookups don't strand later ones", function(new)
+	local h = new()
+	h.RM.Start()
+	local player = h:Join(1)
+	h.Subscriptions[SUB] = SUBSCRIBED
+	h.HoldSubs = true
+	local fetcher = task.spawn(h.RM.GetSubscriptionStatus, player, SUB) -- starts the request
+	local waiter = task.spawn(h.RM.GetSubscriptionStatus, player, SUB) -- joins it
+	local result: any
+	task.spawn(function()
+		result = h.RM.GetSubscriptionStatus(player, SUB)
+	end)
+	task.cancel(fetcher)
+	task.cancel(waiter)
+	h.HoldSubs = false
+	waitFor(function()
+		return result ~= nil
+	end, "surviving lookup")
+	expectEqual(result.IsSubscribed, true, "IsSubscribed")
+	expectEqual(h.SubCalls, 1, "lookups")
+	expectEqual(h.RM.GetSubscriptionStatus(player, SUB).IsSubscribed, true, "cached lookup afterwards")
+end)
+
+test("subscription: a handler registered during a handler run is not run twice", function(new)
+	local h = new()
+	local gate = newGate()
+	local first, firstHandler = recorder()
+	local second, secondHandler = recorder()
+	h.RM.HandleSubscription(SUB, function(...)
+		firstHandler(...)
+		gate.Wait()
+	end)
+	h.RM.Start()
+	h:Join(1)
+	waitFor(function()
+		return gate.Entered == 1
+	end, "first handler to stall")
+	h.RM.HandleSubscription(SUB, secondHandler) -- the join sync is mid-run, so this starts its own
+	gate.Open = true
+	waitFor(function()
+		return #second == 1
+	end, "second handler")
+	task.wait(0.1)
+	expectEqual(#first, 1, "first handler calls")
+	expectEqual(#second, 1, "second handler calls")
+end)
+
 test("subscription: a failing handler is logged", function(new)
 	local h = new()
 	h.RM.HandleSubscription(SUB, function()

@@ -1,7 +1,7 @@
 [Package]
   Name = "vibeonline/razormarket"
   Description = "Oversimplifying the market service"
-  Version = "0.1.1"
+  Version = "0.1.2"
   License = "MIT"
   Website = "https://sawblade-entertainment.github.io/pkg-razor-market/"
 
